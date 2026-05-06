@@ -8,7 +8,7 @@ from rich.console import Console
 
 from kozzle_tts import __version__
 from kozzle_tts.config import SPEAKERS, create_default_config
-from kozzle_tts.main import run, run_retry
+from kozzle_tts.main import organize_by_level, run, run_retry
 
 app = typer.Typer(
     name="kozzle-tts",
@@ -168,6 +168,16 @@ def generate(
             "Use --no-skip-existing to force regeneration."
         ),
     ),
+    level: Optional[int] = typer.Option(
+        None,
+        "--level",
+        "-l",
+        help=(
+            "Only process kor_word rows with this exact level. When set, "
+            "output files are written to {output_dir}/{level}/ instead of "
+            "{output_dir}/ directly."
+        ),
+    ),
 ) -> None:
     """Generate Korean TTS audio files."""
     if mode not in ("custom", "clone", "design"):
@@ -210,6 +220,7 @@ def generate(
             subset=subset,
             resume_from=resume_from,
             skip_existing=skip_existing,
+            level=level,
         )
     except FileNotFoundError as e:
         console.print(f"[red]Error: {e}[/]")
@@ -312,6 +323,59 @@ def retry_failed(
             overrides=overrides,
             output_dir=output_dir,
             skip_existing=skip_existing,
+        )
+    except FileNotFoundError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from None
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/]")
+        raise typer.Exit(1) from None
+
+
+@app.command("organize-by-level")
+def organize_by_level_cmd(
+    config_path: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to Supabase config file (default: ~/.config/kozzle-tts/config.json)",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Output directory to scan (default: from config, usually ./output)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print intended moves without changing the filesystem.",
+    ),
+    unknown_dir_name: str = typer.Option(
+        "unknown",
+        "--unknown-dir-name",
+        help=(
+            "Subdir name for files whose level cannot be resolved "
+            "(record missing in DB, or level column is NULL)."
+        ),
+    ),
+) -> None:
+    """Move existing top-level WAVs in the output dir into per-level subdirs.
+
+    Use this once after pulling level support: it scans
+    ``{output_dir}/*.wav``, looks up each file's kor_word level in
+    Supabase, and moves the file to ``{output_dir}/{level}/``. Files
+    already inside a subdirectory are not touched.
+    """
+    try:
+        organize_by_level(
+            config_path=config_path,
+            output_dir=output_dir,
+            dry_run=dry_run,
+            unknown_dir_name=unknown_dir_name,
         )
     except FileNotFoundError as e:
         console.print(f"[red]Error: {e}[/]")

@@ -180,11 +180,13 @@ def _build_run_config(
     settings: Settings,
     tts_config: TTSConfig,
     skip_existing: bool,
+    level: int | None = None,
 ) -> dict[str, Any]:
     """Serialize the effective run config for the failure log."""
     payload = tts_config.model_dump(mode="json")
     payload["output_dir"] = str(settings.output_dir)
     payload["skip_existing"] = skip_existing
+    payload["level"] = level
     return payload
 
 
@@ -198,12 +200,14 @@ class Processor:
         subset: int | None = None,
         resume_from: int | None = None,
         skip_existing: bool = True,
+        level: int | None = None,
     ):
         self.settings = settings
         self.tts_config = tts_config
         self.subset = subset
         self.resume_from = resume_from
         self.skip_existing = skip_existing
+        self.level = level
         self.db = Database(settings.get_supabase_config())
         self.worker = IsolatedWorker()
         self.failure_log = FailureLog()
@@ -242,8 +246,17 @@ class Processor:
         self._print_effective_config()
 
         console.print("[bold blue]Fetching words from database...[/]")
-        words = self.db.get_kor_words(subset=self.subset, resume_from=self.resume_from)
-        console.print(f"[green]Found {len(words)} words to process[/]")
+        words = self.db.get_kor_words(
+            subset=self.subset,
+            resume_from=self.resume_from,
+            level=self.level,
+        )
+        if self.level is not None:
+            console.print(
+                f"[green]Found {len(words)} words at level {self.level}[/]"
+            )
+        else:
+            console.print(f"[green]Found {len(words)} words to process[/]")
 
         if not words:
             console.print("[yellow]No words found to process[/]")
@@ -478,6 +491,8 @@ class Processor:
         console.print(f"  max_tokens (ceiling): {cfg.max_tokens}")
         console.print(f"  output_dir: {self.settings.output_dir}")
         console.print(f"  skip_existing: {self.skip_existing}")
+        if self.level is not None:
+            console.print(f"  level: {self.level}")
 
     def _finalize(self) -> None:
         try:
@@ -494,7 +509,10 @@ class Processor:
 
         if not self.failure_log.is_empty:
             run_config = _build_run_config(
-                self.settings, self.tts_config, self.skip_existing
+                self.settings,
+                self.tts_config,
+                self.skip_existing,
+                level=self.level,
             )
             path = self.failure_log.write(
                 self.settings.output_dir,
@@ -531,10 +549,15 @@ def run(
     subset: int | None = None,
     resume_from: int | None = None,
     skip_existing: bool = True,
+    level: int | None = None,
 ) -> None:
     settings = Settings.from_config(config_path)
     if output_dir:
         settings.output_dir = output_dir
+    # When filtering by level, all generated files for that run land in a
+    # ``{base}/{level}`` subdirectory so files are grouped by difficulty.
+    if level is not None:
+        settings.output_dir = settings.output_dir / str(level)
 
     tts_config = TTSConfig(
         mode=mode,
@@ -556,9 +579,168 @@ def run(
         subset=subset,
         resume_from=resume_from,
         skip_existing=skip_existing,
+        level=level,
     )
 
     processor.process()
+
+
+def organize_by_level(
+    config_path: Path | None = None,
+    output_dir: Path | None = None,
+    dry_run: bool = False,
+    unknown_dir_name: str = "unknown",
+) -> None:
+    """Move existing top-level WAV files into ``{output_dir}/{level}/``.
+
+    Scans the *top level* of ``output_dir`` only (does not recurse, so
+    files already moved into a level subdir are left alone). Filenames are
+    expected in the form ``{public_id}_word.wav`` or
+    ``{public_id}_example.wav`` as written by ``Processor``. The level for
+    each file is resolved by:
+
+    * word files: looking up ``kor_word.public_id`` -> ``level``.
+    * example files: looking up ``example.public_id`` -> ``kor_word_id``,
+      then ``kor_word.id`` -> ``level``.
+
+    Files whose record is missing in the DB, or whose level is NULL, are
+    moved into ``{output_dir}/{unknown_dir_name}/`` so they don't pile up
+    at the top level.
+    """
+    from uuid import UUID
+
+    settings = Settings.from_config(config_path)
+    if output_dir is not None:
+        settings.output_dir = output_dir
+    base = settings.output_dir
+
+    if not base.exists():
+        console.print(f"[yellow]Output dir does not exist: {base}[/]")
+        return
+
+    # Collect candidate files (top-level only).
+    word_files: dict[UUID, Path] = {}
+    example_files: dict[UUID, Path] = {}
+    skipped_unparsable: list[Path] = []
+    for entry in sorted(base.iterdir()):
+        if not entry.is_file() or entry.suffix.lower() != ".wav":
+            continue
+        stem = entry.stem  # e.g. "<uuid>_word" or "<uuid>_example"
+        if stem.endswith("_word"):
+            uuid_str = stem[: -len("_word")]
+            kind = "word"
+        elif stem.endswith("_example"):
+            uuid_str = stem[: -len("_example")]
+            kind = "example"
+        else:
+            skipped_unparsable.append(entry)
+            continue
+        try:
+            uid = UUID(uuid_str)
+        except ValueError:
+            skipped_unparsable.append(entry)
+            continue
+        if kind == "word":
+            word_files[uid] = entry
+        else:
+            example_files[uid] = entry
+
+    total = len(word_files) + len(example_files)
+    console.print(
+        f"[bold blue]Scanning {base}[/]: "
+        f"{len(word_files)} word file(s), {len(example_files)} example file(s)"
+    )
+    if skipped_unparsable:
+        console.print(
+            f"[dim]Ignoring {len(skipped_unparsable)} file(s) with "
+            f"unrecognized name pattern[/]"
+        )
+    if total == 0:
+        return
+
+    db = Database(settings.get_supabase_config())
+
+    # ---- Resolve levels ----
+    public_id_to_level: dict[UUID, int | None] = {}
+
+    if word_files:
+        words = db.get_kor_words_by_public_ids(list(word_files.keys()))
+        for w in words:
+            public_id_to_level[w.public_id] = w.level
+
+    example_to_word_id: dict[UUID, int] = {}
+    if example_files:
+        examples = db.get_examples_by_public_ids(list(example_files.keys()))
+        for e in examples:
+            example_to_word_id[e.public_id] = e.kor_word_id
+        levels_by_word_id = db.get_kor_word_levels_by_ids(
+            list(example_to_word_id.values())
+        )
+        for pub_id, word_id in example_to_word_id.items():
+            public_id_to_level[pub_id] = levels_by_word_id.get(word_id)
+
+    # ---- Plan and execute moves ----
+    moved = 0
+    unknown = 0
+    skipped_in_place = 0
+    errors = 0
+    by_level: dict[str, int] = {}
+
+    all_files: list[tuple[UUID, Path]] = (
+        list(word_files.items()) + list(example_files.items())
+    )
+
+    for pub_id, src in all_files:
+        level = public_id_to_level.get(pub_id)
+        if pub_id not in public_id_to_level:
+            # Record was missing in DB entirely.
+            target_dir_name: str = unknown_dir_name
+        elif level is None:
+            target_dir_name = unknown_dir_name
+        else:
+            target_dir_name = str(level)
+
+        target_dir = base / target_dir_name
+        dst = target_dir / src.name
+
+        if src == dst or src.parent == target_dir:
+            skipped_in_place += 1
+            continue
+
+        by_level[target_dir_name] = by_level.get(target_dir_name, 0) + 1
+
+        if dry_run:
+            console.print(f"[dim]would move[/] {src.name} -> {target_dir_name}/")
+            continue
+
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                # Don't clobber an existing file at the destination.
+                console.print(
+                    f"[yellow]skip (exists at dest):[/] {dst}"
+                )
+                errors += 1
+                continue
+            src.rename(dst)
+            moved += 1
+            if target_dir_name == unknown_dir_name:
+                unknown += 1
+        except OSError as e:
+            console.print(f"[red]Failed to move {src}: {e}[/]")
+            errors += 1
+
+    console.print(
+        f"\n[bold]Organize done.[/] "
+        f"Moved: [green]{moved}[/]  "
+        f"Unknown level: [yellow]{unknown}[/]  "
+        f"Already in place: [dim]{skipped_in_place}[/]  "
+        f"Errors: [red]{errors}[/]"
+    )
+    if by_level:
+        console.print("[bold]By target dir:[/]")
+        for k in sorted(by_level.keys()):
+            console.print(f"  {k}/  : {by_level[k]}")
 
 
 def run_retry(
@@ -592,7 +774,9 @@ def run_retry(
             console.print(f"  {n}")
 
     settings = Settings.from_config(config_path)
-    # output_dir resolution: explicit CLI override > stored config > Settings default.
+    # output_dir resolution: explicit CLI override > stored config > Settings
+    # default. The stored output_dir already includes the level subdir (if
+    # any) so we don't re-append it on retry.
     if output_dir is not None:
         if str(settings.output_dir) != str(output_dir):
             console.print(
@@ -603,6 +787,7 @@ def run_retry(
         stored_output_dir = stored_config.get("output_dir")
         if stored_output_dir:
             settings.output_dir = Path(stored_output_dir)
+    stored_level = stored_config.get("level")
 
     # Validate ref_audio still exists for clone mode (common gotcha after
     # moving files between machines).
@@ -617,6 +802,7 @@ def run_retry(
         settings=settings,
         tts_config=tts_config,
         skip_existing=skip_existing,
+        level=stored_level,
     )
 
     word_ids = log.word_ids()

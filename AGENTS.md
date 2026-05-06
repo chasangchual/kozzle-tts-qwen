@@ -6,7 +6,7 @@
 - Managed with **uv** — run `uv sync` after adding dependencies.
 - **macOS Apple Silicon required** — mlx-audio runs on Metal GPU.
 - **ffmpeg** must be installed (needed for audio conversion in clone mode).
-- Entry points: `kozzle-tts generate` and `kozzle-tts retry-failed` (Typer app at `src/kozzle_tts/cli.py`).
+- Entry points: `kozzle-tts generate`, `kozzle-tts retry-failed`, `kozzle-tts organize-by-level`, `kozzle-tts init-config` (Typer app at `src/kozzle_tts/cli.py`).
 - No tests, no CI. Pre-existing mypy errors in `database.py` (Supabase response types) and `tts.py` (mlx_audio / soundfile missing stubs) are noise — ignore them and don't try to "fix" without instruction.
 
 ```
@@ -79,6 +79,30 @@ so all-skipped runs never load the model.
 - Examples whose parent word succeeded retry independently — `process_retry`
   does not regenerate the word. `_process_word(process_examples=False)` is
   used on the retry path.
+
+## Level filtering and `output/{level}/` layout
+
+- `generate --level N` filters `kor_word.level == N` (Supabase `eq`) and
+  redirects all generated files to `{output_dir}/{level}/` instead of the
+  flat `{output_dir}/`. Examples inherit the parent word's level
+  implicitly because the run only processes that level's words.
+- The `level` value is recorded in the failure log's stored run config so
+  `retry-failed` lands files in the same subdir without re-passing the
+  flag. `Processor` accepts `level` so the stored value is restored.
+- `organize-by-level` is a one-shot migration for files generated before
+  level support existed. It scans only the *top level* of `output_dir`
+  (files already inside a subdir are left alone), parses
+  `{public_id}_word.wav` / `{public_id}_example.wav`, looks up each
+  file's level in Supabase (examples resolve via `kor_word_id`), and
+  moves the file. Files whose record is missing or whose `level` column
+  is NULL go to `output/unknown/` (override with `--unknown-dir-name`).
+  Always run with `--dry-run` first.
+- Database lookups for migration use `kor_word.public_id` /
+  `example.public_id` (UUIDs as strings); see
+  `Database.get_kor_words_by_public_ids` /
+  `Database.get_examples_by_public_ids` /
+  `Database.get_kor_word_levels_by_ids`. Requests are chunked
+  (200/500) to keep the URL length bounded.
 
 ## Reliability tuning (tunable constants)
 

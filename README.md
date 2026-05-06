@@ -148,6 +148,46 @@ Describe the desired voice characteristics:
 kozzle-tts generate --mode design --instruct "deep male narrator with warm tone"
 ```
 
+## Filtering by level
+
+`kor_word.level` (an integer column in Supabase) groups words by difficulty.
+Pass `--level N` to process only that level — output files are written to
+a `{output_dir}/{level}/` subdirectory instead of directly under
+`{output_dir}/`.
+
+```bash
+# Generate audio only for level 0 words; files land in ./output/0/
+kozzle-tts generate --level 0
+
+# Combine with the usual flags
+kozzle-tts generate --level 2 --speaker Sohee --subset 50
+```
+
+The `level` is recorded in the failure log's stored run config, so
+`retry-failed` automatically lands files in the same `output/{level}/`
+subdir without you re-passing the flag.
+
+### `organize-by-level` — migrate already-generated files
+
+If you've already generated files into the flat `output/` directory and
+want to retrofit the per-level layout, use the migration command:
+
+```bash
+# 1. Preview the moves first (always do this!)
+kozzle-tts organize-by-level --dry-run
+
+# 2. Apply
+kozzle-tts organize-by-level
+```
+
+It scans the **top level** of `output_dir` only (files already inside a
+subdirectory are left alone), parses `{public_id}_word.wav` /
+`{public_id}_example.wav`, looks up each file's level in Supabase
+(examples resolve via their parent `kor_word`), and moves the file to
+`output/{level}/`. Files whose DB record is missing or whose `level`
+column is NULL go to `output/unknown/` (override the name with
+`--unknown-dir-name`). Files at the destination are never clobbered.
+
 ## Incremental runs and recovery
 
 ### Skip already-generated outputs (default)
@@ -225,6 +265,7 @@ kozzle-tts retry-failed output/failed_2026-05-05T14-23-01Z.json
 | `--subset` | | | Max number of words to process |
 | `--resume-from` | `-r` | | Resume from word with this id |
 | `--skip-existing` / `--no-skip-existing` | | `--skip-existing` | Skip items whose output already exists |
+| `--level` | `-l` | | Only process `kor_word` rows with this exact level; output goes to `{output_dir}/{level}/` |
 
 #### `retry-failed`
 
@@ -235,6 +276,19 @@ kozzle-tts retry-failed FAILED_LOG [OPTIONS]
 `FAILED_LOG` is a positional path to a `failed_*.json` file. All `generate`
 flags are accepted as overrides; defaults come from the failed log's stored
 config. The default for `--skip-existing` is **off**.
+
+#### `organize-by-level`
+
+```
+kozzle-tts organize-by-level [OPTIONS]
+```
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--config` | `-c` | auto | Path to Supabase config file |
+| `--output-dir` | `-o` | from config | Output directory to scan |
+| `--dry-run` | | off | Print intended moves without changing the filesystem |
+| `--unknown-dir-name` | | `unknown` | Subdir name for files whose level cannot be resolved |
 
 ### Available Speakers
 
@@ -251,6 +305,11 @@ Audio files are saved as WAV (24 kHz) in the output directory:
 
 - `{public_id}_word.wav` — pronunciation of the Korean lemma
 - `{public_id}_example.wav` — pronunciation of the example sentence
+
+When `--level N` is passed to `generate`, files are written under
+`{output_dir}/{N}/` instead of directly in `{output_dir}/`. Examples
+inherit their parent word's level. Use `organize-by-level` to retrofit
+this layout onto files generated before level support existed.
 
 If a run produces failures, you'll also see:
 
