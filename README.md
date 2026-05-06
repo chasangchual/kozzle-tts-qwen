@@ -8,12 +8,43 @@ Korean TTS audio generator using [Qwen3-TTS](https://github.com/QwenLM/Qwen2.5-O
 - **Python 3.12** (pinned via `.python-version`)
 - **[uv](https://docs.astral.sh/uv/)** for dependency management
 - **ffmpeg** — required for audio conversion in clone mode
+- **PyTorch** — required for clone mode (installed separately, see Install below)
 - Qwen3-TTS model files (see Model Setup below)
 
 ## Install
 
+### 1. Install ffmpeg
+
+Required for audio conversion (clone mode in particular):
+
+```bash
+brew install ffmpeg
+```
+
+### 2. Sync Python dependencies
+
 ```bash
 uv sync
+```
+
+### 3. Install PyTorch (required for clone mode)
+
+`torch` is **not** declared in `pyproject.toml` but is required by mlx-audio's
+clone mode — specifically the Whisper transcriber that runs when you don't
+pass `--ref-text`. Without it, the worker crashes on first generation with
+`PyTorch was not found`:
+
+```bash
+uv pip install torch torchaudio
+```
+
+Custom and design modes work without torch, but installing it is the safe
+default.
+
+### 4. Verify
+
+```bash
+uv run kozzle-tts --help
 ```
 
 ## Model Setup
