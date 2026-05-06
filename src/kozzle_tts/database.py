@@ -1,11 +1,14 @@
 """Supabase database client and queries."""
 
+import logging
 from dataclasses import dataclass
 from uuid import UUID
 
 from supabase import Client, create_client
 
 from kozzle_tts.config import SupabaseConfig
+
+logger = logging.getLogger(__name__)
 
 
 class KozzleTTSError(Exception):
@@ -101,6 +104,88 @@ class Database:
             )
             for row in response.data
         ]
+
+    def get_kor_words_by_ids(self, ids: list[int]) -> list[KorWord]:
+        """Fetch Korean words by a list of ids.
+
+        Used by the ``retry-failed`` command. Logs a warning for any
+        requested ids that didn't come back (deleted in DB since the
+        original run).
+        """
+        if not ids:
+            return []
+
+        response = (
+            self.client.table("kor_word")
+            .select("*")
+            .in_("id", ids)
+            .order("id", desc=False)
+            .execute()
+        )
+
+        rows = response.data or []
+        words = [
+            KorWord(
+                id=row["id"],
+                public_id=UUID(row["public_id"]),
+                lemma=row["lemma"],
+                created_at=row["created_at"],
+                definition=row.get("definition"),
+                pos_id=row.get("pos_id"),
+                level=row.get("level"),
+                pronunciation=row.get("pronunciation"),
+            )
+            for row in rows
+        ]
+
+        returned_ids = {w.id for w in words}
+        missing = [i for i in ids if i not in returned_ids]
+        if missing:
+            logger.warning(
+                "kor_word ids missing from DB (likely deleted): %s",
+                missing,
+            )
+        return words
+
+    def get_examples_by_ids(self, ids: list[int]) -> list[Example]:
+        """Fetch examples by a list of ids.
+
+        Used by the ``retry-failed`` command. Logs a warning for any
+        requested ids that didn't come back.
+        """
+        if not ids:
+            return []
+
+        response = (
+            self.client.table("example")
+            .select("*")
+            .in_("id", ids)
+            .order("id", desc=False)
+            .execute()
+        )
+
+        rows = response.data or []
+        examples = [
+            Example(
+                id=row["id"],
+                public_id=UUID(row["public_id"]),
+                kor_word_id=row["kor_word_id"],
+                text=row["text"],
+                created_at=row["created_at"],
+                type=row.get("type"),
+                source=row.get("source"),
+            )
+            for row in rows
+        ]
+
+        returned_ids = {e.id for e in examples}
+        missing = [i for i in ids if i not in returned_ids]
+        if missing:
+            logger.warning(
+                "example ids missing from DB (likely deleted): %s",
+                missing,
+            )
+        return examples
 
     def get_examples_for_word(self, kor_word_id: int) -> list[Example]:
         """Fetch example sentences for a Korean word.
