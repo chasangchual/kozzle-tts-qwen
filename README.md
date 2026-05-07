@@ -208,6 +208,21 @@ kozzle-tts generate --subset 100 --no-skip-existing
 Output filenames are content-addressed by the row's `public_id`, so moving or
 renaming files in `output/` will cause the next run to regenerate them.
 
+### Fetching all words (Supabase row cap)
+
+Supabase / PostgREST caps a single response at **1000 rows by default**.
+`generate` and `retry-failed` page through `kor_word` automatically using
+`.range(from, to)` (page size 1000), so you'll get the full table even if
+it has more than 1000 rows.
+
+- Without `--subset`, all rows matching `--resume-from` (if given) are
+  fetched across as many round trips as needed.
+- With `--subset N`, the loop stops once `N` rows have been collected; the
+  last page is sized down so we don't over-fetch.
+
+If your Supabase project's `max-rows` setting is lower than 1000, lower
+`_PAGE_SIZE` in `src/kozzle_tts/database.py` to match.
+
 ### Failure log and `retry-failed`
 
 Any `generate` run that produces at least one failure writes:

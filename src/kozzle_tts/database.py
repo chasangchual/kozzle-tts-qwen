@@ -11,6 +11,13 @@ from kozzle_tts.config import SupabaseConfig
 logger = logging.getLogger(__name__)
 
 
+# PostgREST (and therefore Supabase) caps a single response at 1000 rows by
+# default. We page through results with .range(from, to) so callers always
+# get the full set regardless of table size. Keep this <= the server's
+# max-rows setting; 1000 is the safe default.
+_PAGE_SIZE = 1000
+
+
 class KozzleTTSError(Exception):
     """Base exception for kozzle-tts."""
 
@@ -72,29 +79,49 @@ class Database:
     ) -> list[KorWord]:
         """Fetch Korean words from database.
 
+        Pages through results with PostgREST's ``.range(from, to)`` because
+        Supabase caps single responses at 1000 rows by default.
+
         Args:
-            subset: Maximum number of words to fetch.
+            subset: Maximum number of words to fetch (across all pages).
             resume_from: Start from words with id >= resume_from.
             level: If set, only return words with this exact level.
 
         Returns:
             List of KorWord objects.
         """
-        query = self.client.table("kor_word").select("*").order("id", desc=False)
+        all_rows: list[dict] = []
+        offset = 0
 
-        if resume_from is not None:
-            query = query.gte("id", resume_from)
+        while True:
+            # Cap this page if a subset cap would be hit before the full
+            # page size; saves a partial round trip.
+            page_size = _PAGE_SIZE
+            if subset is not None:
+                remaining = subset - len(all_rows)
+                if remaining <= 0:
+                    break
+                page_size = min(_PAGE_SIZE, remaining)
 
-        if level is not None:
-            query = query.eq("level", level)
+            query = self.client.table("kor_word").select("*").order("id", desc=False)
 
-        if subset is not None:
-            query = query.limit(subset)
+            if resume_from is not None:
+                query = query.gte("id", resume_from)
 
-        response = query.execute()
+            if level is not None:
+                query = query.eq("level", level)
 
-        if response.data is None:
-            return []
+            query = query.range(offset, offset + page_size - 1)
+
+            response = query.execute()
+            page = response.data or []
+            all_rows.extend(page)
+
+            # Last page reached when the server returns fewer rows than asked.
+            if len(page) < page_size:
+                break
+
+            offset += page_size
 
         return [
             KorWord(
@@ -107,7 +134,7 @@ class Database:
                 level=row.get("level"),
                 pronunciation=row.get("pronunciation"),
             )
-            for row in response.data
+            for row in all_rows
         ]
 
     def get_kor_words_by_ids(self, ids: list[int]) -> list[KorWord]:
