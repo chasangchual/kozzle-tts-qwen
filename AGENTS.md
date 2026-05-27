@@ -108,13 +108,25 @@ so all-skipped runs never load the model.
 
 - `main.py`: `_MAX_RETRIES_PER_ITEM = 1`, `_MAX_CONSECUTIVE_FAILURES = 3`.
   After 3 distinct items fail in a row the run aborts (writes failure log
-  first) to avoid burning the queue on a genuinely broken GPU.
+  first) to avoid burning the queue on a genuinely broken GPU. The
+  consecutive-failure counter is shared across GPU failures and Supabase
+  fetch failures — if either subsystem is genuinely broken we stop.
 - `main.py`: `_compute_timeout(text)` clamps each generate call to
   `[30, 300]` seconds, scaled by text length.
 - `tts.py`: `_compute_max_tokens(text, ceiling)` makes the CLI
   `--max-tokens` value the upper bound, scaling down for short text. This
   shrinks the GPU command buffer for single words and helps avoid the
   Metal `kIOGPUCommandBufferCallbackErrorImpactingInteractivity` abort.
+- `database.py`: `_DB_READ_TIMEOUT_S = 60.0`, `_DB_MAX_RETRIES = 3`,
+  backoff `1s / 3s / 9s` (`_DB_BACKOFF_BASE_S = 1.0`,
+  `_DB_BACKOFF_FACTOR = 3.0`). The Supabase client is built with an
+  explicit `httpx.Client` whose `HTTPTransport(retries=3)` handles
+  connection-level retries; `_with_retry()` adds read-timeout retries
+  on top (httpx does NOT retry once the request has been sent). On
+  exhaustion the wrapper raises `DatabaseError`. Postgrest's stock 120 s
+  read timeout was the original cause of `Unexpected error: The read
+  operation timed out` — a single stalled round trip would stall the
+  whole queue for two minutes before failing.
 
 ## Known noisy warnings (silenced in `tts._silence_known_warnings()`)
 
@@ -143,6 +155,18 @@ runs inside the worker subprocess before `mlx_load_model()`.
   regeneration without touching files, pass `--no-skip-existing`.
 - **`max_tokens` is a ceiling, not a target.** Effective value is adaptive
   per text length (see `tts._compute_max_tokens`).
+- **Mid-run Supabase timeouts no longer abort the run.** A `DatabaseError`
+  on `get_examples_for_word` is recorded against the parent word in the
+  failure log and the loop continues. Re-run `generate` (incremental by
+  default) or `retry-failed failed_latest.json` to pick up the missed
+  examples — the retry path re-fetches examples from the DB fresh. Three
+  consecutive DB failures still trip the shared circuit breaker and abort
+  the run cleanly with a failure log written.
+- **`process()` / `process_retry()` always write the failure log.** Both
+  wrap their body in `try/finally: self._finalize()`, and `_finalize()`
+  is idempotent (guarded by `self._finalized`). Even if an unexpected
+  exception escapes the iteration loop, the in-flight failure log is
+  flushed to disk before the exception propagates to the CLI.
 
 ## Key conventions
 

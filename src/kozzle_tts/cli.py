@@ -8,6 +8,7 @@ from rich.console import Console
 
 from kozzle_tts import __version__
 from kozzle_tts.config import SPEAKERS, create_default_config
+from kozzle_tts.database import DatabaseError
 from kozzle_tts.main import organize_by_level, run, run_retry
 
 app = typer.Typer(
@@ -228,6 +229,19 @@ def generate(
     except ValueError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1) from None
+    except DatabaseError as e:
+        # Distinct branch so the user sees a network-flavored message
+        # instead of the raw httpx string ("The read operation timed
+        # out") that confused us in the past. The Database layer already
+        # retried; reaching here means the connection is genuinely
+        # broken.
+        console.print(f"[red]Database error:[/] {e}")
+        console.print(
+            "[yellow]Check network connectivity and Supabase status, then "
+            "re-run. Generate is incremental by default so finished items "
+            "will be skipped.[/]"
+        )
+        raise typer.Exit(1) from None
     except Exception as e:
         console.print(f"[red]Unexpected error: {e}[/]")
         raise typer.Exit(1) from None
@@ -330,6 +344,13 @@ def retry_failed(
     except ValueError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1) from None
+    except DatabaseError as e:
+        console.print(f"[red]Database error:[/] {e}")
+        console.print(
+            "[yellow]Check network connectivity and Supabase status, then "
+            "re-run.[/]"
+        )
+        raise typer.Exit(1) from None
     except Exception as e:
         console.print(f"[red]Unexpected error: {e}[/]")
         raise typer.Exit(1) from None
@@ -382,6 +403,13 @@ def organize_by_level_cmd(
         raise typer.Exit(1) from None
     except ValueError as e:
         console.print(f"[red]Error: {e}[/]")
+        raise typer.Exit(1) from None
+    except DatabaseError as e:
+        console.print(f"[red]Database error:[/] {e}")
+        console.print(
+            "[yellow]Check network connectivity and Supabase status, then "
+            "re-run.[/]"
+        )
         raise typer.Exit(1) from None
     except Exception as e:
         console.print(f"[red]Unexpected error: {e}[/]")

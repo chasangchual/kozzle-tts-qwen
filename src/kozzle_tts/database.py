@@ -1,10 +1,14 @@
 """Supabase database client and queries."""
 
 import logging
+import time
 from dataclasses import dataclass
+from typing import Callable, TypeVar
 from uuid import UUID
 
+import httpx
 from supabase import Client, create_client
+from supabase.client import ClientOptions
 
 from kozzle_tts.config import SupabaseConfig
 
@@ -17,6 +21,32 @@ logger = logging.getLogger(__name__)
 # max-rows setting; 1000 is the safe default.
 _PAGE_SIZE = 1000
 
+# --- Reliability tuning ---------------------------------------------------
+# Postgrest's stock default is a 120 s read timeout, which is far too long
+# for an interactive run: a single bad Supabase round trip can stall the
+# whole queue for two minutes before failing. We use a shorter read timeout
+# and retry transient failures (httpx ReadTimeout, NetworkError,
+# RemoteProtocolError) up to ``_DB_MAX_RETRIES`` times with exponential
+# backoff. All Database methods here are reads, so retrying is safe.
+_DB_CONNECT_TIMEOUT_S = 10.0
+_DB_READ_TIMEOUT_S = 60.0
+_DB_WRITE_TIMEOUT_S = 30.0
+_DB_POOL_TIMEOUT_S = 10.0
+_DB_MAX_RETRIES = 3  # total attempts = _DB_MAX_RETRIES + 1
+_DB_BACKOFF_BASE_S = 1.0  # 1s, 3s, 9s ...
+_DB_BACKOFF_FACTOR = 3.0
+
+# Exceptions that indicate a transient transport-layer hiccup. We retry
+# these. Anything else (e.g. HTTPStatusError 4xx/5xx, JSON decode errors)
+# is treated as fatal for the call.
+_TRANSIENT_HTTP_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+)
+
+T = TypeVar("T")
+
 
 class KozzleTTSError(Exception):
     """Base exception for kozzle-tts."""
@@ -25,7 +55,13 @@ class KozzleTTSError(Exception):
 
 
 class DatabaseError(KozzleTTSError):
-    """Database-related error."""
+    """Database-related error.
+
+    Raised when a Supabase request fails after exhausting all retries, or
+    when the response shape is otherwise unusable. The CLI surfaces this
+    with a dedicated branch so the user gets a meaningful message rather
+    than the raw ``httpx`` string.
+    """
 
     pass
 
@@ -57,6 +93,66 @@ class Example:
     source: str | None = None
 
 
+def _build_httpx_client() -> httpx.Client:
+    """Construct the explicit httpx.Client used by the Supabase client.
+
+    Important details:
+
+    * We set a short-ish read timeout so a stalled Supabase response fails
+      fast and our retry layer can kick in.
+    * ``HTTPTransport(retries=N)`` retries only on *connection* errors
+      (DNS, TCP handshake) — it does NOT retry once the request has been
+      sent. That's why we still need an explicit retry loop in
+      ``_with_retry`` for ``ReadTimeout``.
+    * ``http2=True`` matches postgrest's own default; specified explicitly
+      so the behavior doesn't shift if upstream changes.
+    """
+    timeout = httpx.Timeout(
+        connect=_DB_CONNECT_TIMEOUT_S,
+        read=_DB_READ_TIMEOUT_S,
+        write=_DB_WRITE_TIMEOUT_S,
+        pool=_DB_POOL_TIMEOUT_S,
+    )
+    transport = httpx.HTTPTransport(retries=_DB_MAX_RETRIES)
+    return httpx.Client(
+        timeout=timeout,
+        transport=transport,
+        http2=True,
+        follow_redirects=True,
+    )
+
+
+def _with_retry(fn: Callable[[], T], label: str) -> T:
+    """Run ``fn``, retrying transient httpx errors with exponential backoff.
+
+    Re-raises a :class:`DatabaseError` once retries are exhausted so the
+    upper layers (Processor / CLI) can handle it without unwrapping httpx
+    internals.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(_DB_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except _TRANSIENT_HTTP_EXCEPTIONS as e:
+            last_exc = e
+            if attempt >= _DB_MAX_RETRIES:
+                break
+            backoff = _DB_BACKOFF_BASE_S * (_DB_BACKOFF_FACTOR ** attempt)
+            logger.warning(
+                "Supabase %s failed (attempt %d/%d): %s; retrying in %.1fs",
+                label,
+                attempt + 1,
+                _DB_MAX_RETRIES + 1,
+                e,
+                backoff,
+            )
+            time.sleep(backoff)
+    raise DatabaseError(
+        f"Supabase {label} failed after {_DB_MAX_RETRIES + 1} attempt(s): "
+        f"{last_exc}"
+    ) from last_exc
+
+
 class Database:
     """Supabase database client."""
 
@@ -66,9 +162,20 @@ class Database:
 
     @property
     def client(self) -> Client:
-        """Get or create Supabase client."""
+        """Get or create Supabase client.
+
+        We hand Supabase an explicit ``httpx.Client`` so we control the
+        timeouts and connection-retry policy. Without this the underlying
+        postgrest client uses a 120 s read timeout, which makes a single
+        stalled request feel like a hang.
+        """
         if self._client is None:
-            self._client = create_client(self._config.url, self._config.service_role_key)
+            options = ClientOptions(httpx_client=_build_httpx_client())
+            self._client = create_client(
+                self._config.url,
+                self._config.service_role_key,
+                options=options,
+            )
         return self._client
 
     def get_kor_words(
@@ -103,17 +210,20 @@ class Database:
                     break
                 page_size = min(_PAGE_SIZE, remaining)
 
-            query = self.client.table("kor_word").select("*").order("id", desc=False)
+            def _do_page(
+                _offset: int = offset, _page_size: int = page_size
+            ):
+                query = self.client.table("kor_word").select("*").order(
+                    "id", desc=False
+                )
+                if resume_from is not None:
+                    query = query.gte("id", resume_from)
+                if level is not None:
+                    query = query.eq("level", level)
+                query = query.range(_offset, _offset + _page_size - 1)
+                return query.execute()
 
-            if resume_from is not None:
-                query = query.gte("id", resume_from)
-
-            if level is not None:
-                query = query.eq("level", level)
-
-            query = query.range(offset, offset + page_size - 1)
-
-            response = query.execute()
+            response = _with_retry(_do_page, "kor_word page fetch")
             page = response.data or []
             all_rows.extend(page)
 
@@ -147,13 +257,16 @@ class Database:
         if not ids:
             return []
 
-        response = (
-            self.client.table("kor_word")
-            .select("*")
-            .in_("id", ids)
-            .order("id", desc=False)
-            .execute()
-        )
+        def _do():
+            return (
+                self.client.table("kor_word")
+                .select("*")
+                .in_("id", ids)
+                .order("id", desc=False)
+                .execute()
+            )
+
+        response = _with_retry(_do, "kor_word fetch by ids")
 
         rows = response.data or []
         words = [
@@ -188,13 +301,16 @@ class Database:
         if not ids:
             return []
 
-        response = (
-            self.client.table("example")
-            .select("*")
-            .in_("id", ids)
-            .order("id", desc=False)
-            .execute()
-        )
+        def _do():
+            return (
+                self.client.table("example")
+                .select("*")
+                .in_("id", ids)
+                .order("id", desc=False)
+                .execute()
+            )
+
+        response = _with_retry(_do, "example fetch by ids")
 
         rows = response.data or []
         examples = [
@@ -237,12 +353,17 @@ class Database:
         out: list[KorWord] = []
         chunk = 200
         for i in range(0, len(str_ids), chunk):
-            response = (
-                self.client.table("kor_word")
-                .select("*")
-                .in_("public_id", str_ids[i : i + chunk])
-                .execute()
-            )
+            batch = str_ids[i : i + chunk]
+
+            def _do(_batch: list[str] = batch):
+                return (
+                    self.client.table("kor_word")
+                    .select("*")
+                    .in_("public_id", _batch)
+                    .execute()
+                )
+
+            response = _with_retry(_do, "kor_word fetch by public_ids")
             for row in response.data or []:
                 out.append(
                     KorWord(
@@ -273,12 +394,17 @@ class Database:
         out: list[Example] = []
         chunk = 200
         for i in range(0, len(str_ids), chunk):
-            response = (
-                self.client.table("example")
-                .select("*")
-                .in_("public_id", str_ids[i : i + chunk])
-                .execute()
-            )
+            batch = str_ids[i : i + chunk]
+
+            def _do(_batch: list[str] = batch):
+                return (
+                    self.client.table("example")
+                    .select("*")
+                    .in_("public_id", _batch)
+                    .execute()
+                )
+
+            response = _with_retry(_do, "example fetch by public_ids")
             for row in response.data or []:
                 out.append(
                     Example(
@@ -308,12 +434,17 @@ class Database:
         chunk = 500
         unique = list({i for i in ids})
         for i in range(0, len(unique), chunk):
-            response = (
-                self.client.table("kor_word")
-                .select("id,level")
-                .in_("id", unique[i : i + chunk])
-                .execute()
-            )
+            batch = unique[i : i + chunk]
+
+            def _do(_batch: list[int] = batch):
+                return (
+                    self.client.table("kor_word")
+                    .select("id,level")
+                    .in_("id", _batch)
+                    .execute()
+                )
+
+            response = _with_retry(_do, "kor_word level fetch")
             for row in response.data or []:
                 out[row["id"]] = row.get("level")
         return out
@@ -327,7 +458,16 @@ class Database:
         Returns:
             List of Example objects.
         """
-        response = self.client.table("example").select("*").eq("kor_word_id", kor_word_id).execute()
+
+        def _do():
+            return (
+                self.client.table("example")
+                .select("*")
+                .eq("kor_word_id", kor_word_id)
+                .execute()
+            )
+
+        response = _with_retry(_do, "example fetch for word")
 
         if response.data is None:
             return []

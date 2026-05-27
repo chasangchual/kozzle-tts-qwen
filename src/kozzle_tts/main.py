@@ -21,7 +21,7 @@ from rich.progress import (
 
 from kozzle_tts import __version__
 from kozzle_tts.config import Settings, TTSConfig
-from kozzle_tts.database import Database, Example, KorWord
+from kozzle_tts.database import Database, DatabaseError, Example, KorWord
 from kozzle_tts.failure_log import FailureLog, _now_iso
 from kozzle_tts.tts import TTSError
 
@@ -217,6 +217,7 @@ class Processor:
         self._consecutive_failures = 0
         self._aborted = False
         self._worker_started = False
+        self._finalized = False
 
     # ----- worker lifecycle -----
 
@@ -262,11 +263,19 @@ class Processor:
             console.print("[yellow]No words found to process[/]")
             return
 
-        self._run_with_progress(
-            description_total=len(words),
-            iterate=lambda progress, task: self._iterate_words(words, progress, task),
-        )
-        self._finalize()
+        # try/finally guarantees _finalize() runs even if an unexpected
+        # exception (e.g. surprise httpx error not caught by Database's
+        # retry layer) escapes the iteration loop. Without this, the
+        # user loses the in-flight failure log and can't easily resume.
+        try:
+            self._run_with_progress(
+                description_total=len(words),
+                iterate=lambda progress, task: self._iterate_words(
+                    words, progress, task
+                ),
+            )
+        finally:
+            self._finalize()
 
     def process_retry(
         self,
@@ -284,13 +293,15 @@ class Processor:
         if total == 0:
             return
 
-        self._run_with_progress(
-            description_total=total,
-            iterate=lambda progress, task: self._iterate_retry(
-                words, examples, progress, task
-            ),
-        )
-        self._finalize()
+        try:
+            self._run_with_progress(
+                description_total=total,
+                iterate=lambda progress, task: self._iterate_retry(
+                    words, examples, progress, task
+                ),
+            )
+        finally:
+            self._finalize()
 
     # ----- iteration -----
 
@@ -385,7 +396,33 @@ class Processor:
         if not ok or self._aborted or not process_examples:
             return
 
-        examples = self.db.get_examples_for_word(word.id)
+        # Fetching examples is a Supabase round trip. If that times out
+        # mid-run we don't want to tank the whole queue: record the word
+        # as a fetch-failure (so retry-failed can pick it up and re-fetch
+        # examples cleanly) and let the loop continue. We treat this the
+        # same as any other failure for circuit-breaker purposes — if the
+        # network is genuinely gone, three of these in a row will abort
+        # the run cleanly.
+        try:
+            examples = self.db.get_examples_for_word(word.id)
+        except DatabaseError as e:
+            progress.console.print(
+                f"  [red]\u2717[/] Failed to fetch examples for word "
+                f"{word.lemma!r} (id={word.id}): {e}"
+            )
+            self.failure_log.add_word_failure(
+                word, attempts=1, error=f"fetch examples failed: {e}"
+            )
+            self._n_failed += 1
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                progress.console.print(
+                    f"[bold red]Aborting run after "
+                    f"{_MAX_CONSECUTIVE_FAILURES} consecutive failures[/]"
+                )
+                self._aborted = True
+            return
+
         if examples:
             progress.console.print(f"  [blue]Found {len(examples)} example(s)[/]")
             for example in examples:
@@ -495,6 +532,16 @@ class Processor:
             console.print(f"  level: {self.level}")
 
     def _finalize(self) -> None:
+        # Idempotent: safe to call more than once. Important because
+        # ``process()`` / ``process_retry()`` wrap their bodies in
+        # try/finally, so on a clean exit we run normally, and on an
+        # exceptional exit we run as part of cleanup. Double-invocation
+        # would otherwise re-write the failure log and re-raise the
+        # abort error.
+        if getattr(self, "_finalized", False):
+            return
+        self._finalized = True
+
         try:
             self.worker.stop()
         except Exception:
@@ -514,17 +561,24 @@ class Processor:
                 self.skip_existing,
                 level=self.level,
             )
-            path = self.failure_log.write(
-                self.settings.output_dir,
-                run_config=run_config,
-                kozzle_tts_version=__version__,
-                run_id=_now_iso(),
-            )
-            console.print(
-                f"[yellow]Failure log written:[/] {path}\n"
-                f"  Retry with: kozzle-tts retry-failed "
-                f"{self.settings.output_dir / 'failed_latest.json'}"
-            )
+            try:
+                path = self.failure_log.write(
+                    self.settings.output_dir,
+                    run_config=run_config,
+                    kozzle_tts_version=__version__,
+                    run_id=_now_iso(),
+                )
+                console.print(
+                    f"[yellow]Failure log written:[/] {path}\n"
+                    f"  Retry with: kozzle-tts retry-failed "
+                    f"{self.settings.output_dir / 'failed_latest.json'}"
+                )
+            except Exception as e:
+                # Never let a failure-log write error mask the underlying
+                # problem when _finalize is running as cleanup.
+                console.print(
+                    f"[red]Failed to write failure log: {e}[/]"
+                )
 
         if self._aborted:
             raise TTSError(
